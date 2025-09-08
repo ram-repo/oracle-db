@@ -1,4 +1,3 @@
-# Dockerfile - Oracle XE 21c (runtime as non-root oracle)
 FROM oraclelinux:7-slim
 
 ARG XE_RPM=oracle-database-xe-21c-1.0-1.ol8.x86_64.rpm
@@ -6,12 +5,13 @@ ENV ORACLE_HOME=/opt/oracle/product/21c/dbhomeXE \
     ORACLE_BASE=/opt/oracle \
     ORACLE_SID=XE \
     PATH=/opt/oracle/product/21c/dbhomeXE/bin:$PATH \
-    ORA_INVENTORY=/opt/oraInventory
+    ORA_INVENTORY=/opt/oraInventory \
+    ORACLE_PASSWORD=ChangeMe123
 
-# Copy RPM (must be placed alongside Dockerfile)
+# Copy Oracle XE RPM (must be present alongside Dockerfile)
 COPY ${XE_RPM} /tmp/${XE_RPM}
 
-# Install prerequisites, rpm, gosu, and cleanup
+# Install Oracle prerequisites, RPM, utilities, gosu
 RUN yum -y install oracle-database-preinstall-21c \
     && yum -y localinstall /tmp/${XE_RPM} \
     && yum -y install which shadow-utils passwd procps-ng curl \
@@ -19,37 +19,36 @@ RUN yum -y install oracle-database-preinstall-21c \
     && chmod +x /usr/local/bin/gosu \
     && rm -f /tmp/${XE_RPM} \
     && yum clean all
-# Create only writable dirs and adjust ownership
+
+# Create oracle user & group explicitly (to align with K8s fsGroup)
+RUN usermod -u 54321 oracle && groupmod -g 54321 oinstall
+
+# Create necessary writable dirs with correct permissions
 RUN mkdir -p ${ORACLE_BASE}/oradata \
            ${ORACLE_BASE}/diag \
            /u01 \
            /opt/oracle/cfgtoollogs \
-    && chown -R oracle:oinstall ${ORACLE_BASE}/oradata \
-                               ${ORACLE_BASE}/diag \
-                               /u01 \
-                               /opt/oracle/cfgtoollogs \
-    && chmod -R 775 ${ORACLE_BASE}/oradata \
-                    ${ORACLE_BASE}/diag \
-                    /u01 \
-                    /opt/oracle/cfgtoollogs
+    && chown -R oracle:oinstall ${ORACLE_BASE} /u01 /opt/oracle \
+    && chmod -R 775 ${ORACLE_BASE} /u01 /opt/oracle
 
-# Fix oradism (root must own it, with SUID)
+# Fix oradism binary (must be root-owned, suid bit set)
 RUN chown root:oinstall ${ORACLE_HOME}/bin/oradism \
     && chmod 4750 ${ORACLE_HOME}/bin/oradism
 
-
-# Copy entrypoint
+# Copy entrypoint script
 COPY entrypoint.sh /opt/oracle/docker-entrypoint.sh
-RUN chmod +x /opt/oracle/docker-entrypoint.sh
+RUN chmod +x /opt/oracle/docker-entrypoint.sh \
+    && chown oracle:oinstall /opt/oracle/docker-entrypoint.sh
+
+# Switch to oracle user by default (K8s non-root support)
+USER oracle
 
 # Expose DB and EM ports
 EXPOSE 1521 5500
 
-# Healthcheck
-HEALTHCHECK --interval=15s --start-period=60s --timeout=5s --retries=10 \
-  CMD echo 'select 1 from dual;' | gosu oracle sqlplus -s system/${ORACLE_PASSWORD:-ChangeMe123}@//localhost:1521/XEPDB1 >/dev/null 2>&1 || exit 1
+# Healthcheck (runs as oracle via gosu)
+HEALTHCHECK --interval=30s --start-period=90s --timeout=10s --retries=10 \
+  CMD echo 'select 1 from dual;' | sqlplus -s system/${ORACLE_PASSWORD}@//localhost:1521/XEPDB1 >/dev/null 2>&1 || exit 1
 
-# Entrypoint: starts as root → drops to oracle
 ENTRYPOINT ["/opt/oracle/docker-entrypoint.sh"]
-
 CMD ["bash"]
